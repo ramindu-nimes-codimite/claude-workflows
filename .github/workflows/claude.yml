@@ -99,6 +99,9 @@ jobs:
           # PR author login for pull_request events — used to detect a
           # Dependabot/Renovate bump vs. a human-authored PR.
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          # PR base branch for pull_request events — used to force an audit
+          # on anything landing on a release branch, regardless of author.
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
           # Who triggered this run — `Bot` for anything posted by an app.
           SENDER_TYPE: ${{ github.event.sender.type }}
           # The text that carried the @claude mention, per event type.
@@ -112,28 +115,41 @@ jobs:
           emit() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
 
           # --- pull_request events carry no mention: automatic review, or
-          # --- automatic dependency audit when the PR author is a known
-          # --- dependency bot (Dependabot/Renovate).
+          # --- automatic dependency audit when either the PR author is a
+          # --- known dependency bot (Dependabot/Renovate) or the PR targets
+          # --- a release branch (release, release/*, releases/*) — any
+          # --- dependency drift landing on a release branch gets audited
+          # --- regardless of who opened the PR.
           if [ "$EVENT" = 'pull_request' ]; then
             pr_author_lower=$(printf '%s' "$PR_AUTHOR" | tr '[:upper:]' '[:lower:]')
+            base_ref_lower=$(printf '%s' "$BASE_REF" | tr '[:upper:]' '[:lower:]')
+
+            is_dependency_bot=false
             case "$pr_author_lower" in
-              'dependabot[bot]'|'renovate[bot]')
-                case "$(printf '%s' "$AUTO_DEPENDENCY_AUDIT" | tr '[:upper:]' '[:lower:]')" in
-                  false|0|off|no|disabled) mode=none ;;
-                  *)                       mode=audit ;;
-                esac
-                ;;
-              *)
-                case "$(printf '%s' "$AUTO_PR_REVIEW" | tr '[:upper:]' '[:lower:]')" in
-                  false|0|off|no|disabled) mode=none ;;
-                  *)                       mode=review ;;
-                esac
-                ;;
+              'dependabot[bot]'|'renovate[bot]') is_dependency_bot=true ;;
             esac
+
+            is_release_branch=false
+            case "$base_ref_lower" in
+              release|release/*|releases/*) is_release_branch=true ;;
+            esac
+
+            if [ "$is_dependency_bot" = true ] || [ "$is_release_branch" = true ]; then
+              case "$(printf '%s' "$AUTO_DEPENDENCY_AUDIT" | tr '[:upper:]' '[:lower:]')" in
+                false|0|off|no|disabled) mode=none ;;
+                *)                       mode=audit ;;
+              esac
+            else
+              case "$(printf '%s' "$AUTO_PR_REVIEW" | tr '[:upper:]' '[:lower:]')" in
+                false|0|off|no|disabled) mode=none ;;
+                *)                       mode=review ;;
+              esac
+            fi
+
             emit mode "$mode"
             emit mention ''
             emit model_args ''
-            echo "pull_request event (author=$PR_AUTHOR) -> mode=$mode"
+            echo "pull_request event (author=$PR_AUTHOR, base=$BASE_REF) -> mode=$mode"
             exit 0
           fi
 
