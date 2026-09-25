@@ -20,7 +20,12 @@ name: Claude Code (reusable)
 #   @claude review              → review the PR (docs context + inline comments)
 #   @claude fix <description>   → implement the change and push a commit
 #   @claude ask <question>      → answer only; never edits files
+#   @claude audit                → summarize a dependency bump: vulnerability
+#                                   fixed, affected files, new features, deprecations
 #   @claude <anything else>     → `ask` (the safe default — nothing is written)
+#
+# `audit` also runs automatically when Dependabot/Renovate opens a PR (see
+# auto_dependency_audit below).
 #
 # Model selection composes with every command:
 #   @claude-opus review         → review with Opus
@@ -38,6 +43,16 @@ on:
           Callers pass their own CLAUDE_AUTO_PR_REVIEW repository variable
           here. `false`, `0`, `off`, `no`, or `disabled` (case-insensitive)
           disables it; anything else leaves it enabled.
+        type: string
+        required: false
+        default: 'true'
+      auto_dependency_audit:
+        description: >-
+          Controls the automatic dependency audit that runs when Dependabot
+          or Renovate opens a pull request. Callers pass their own
+          CLAUDE_AUTO_DEPENDENCY_AUDIT repository variable here. `false`,
+          `0`, `off`, `no`, or `disabled` (case-insensitive) disables it;
+          anything else leaves it enabled.
         type: string
         required: false
         default: 'true'
@@ -63,7 +78,7 @@ jobs:
     timeout-minutes: 5
     permissions: {}
     outputs:
-      # One of: review | fix | ask | help | none
+      # One of: review | fix | ask | help | audit | none
       mode: ${{ steps.parse.outputs.mode }}
       # The mention that was actually typed (@claude, @claude-opus, @claude-haiku).
       # The action only responds to comments containing its trigger phrase, so
@@ -80,6 +95,10 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           AUTO_PR_REVIEW: ${{ inputs.auto_pr_review }}
+          AUTO_DEPENDENCY_AUDIT: ${{ inputs.auto_dependency_audit }}
+          # PR author login for pull_request events — used to detect a
+          # Dependabot/Renovate bump vs. a human-authored PR.
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           # Who triggered this run — `Bot` for anything posted by an app.
           SENDER_TYPE: ${{ github.event.sender.type }}
           # The text that carried the @claude mention, per event type.
@@ -92,16 +111,29 @@ jobs:
 
           emit() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
 
-          # --- pull_request events carry no mention: automatic review only ---
+          # --- pull_request events carry no mention: automatic review, or
+          # --- automatic dependency audit when the PR author is a known
+          # --- dependency bot (Dependabot/Renovate).
           if [ "$EVENT" = 'pull_request' ]; then
-            case "$(printf '%s' "$AUTO_PR_REVIEW" | tr '[:upper:]' '[:lower:]')" in
-              false|0|off|no|disabled) mode=none ;;
-              *)                       mode=review ;;
+            pr_author_lower=$(printf '%s' "$PR_AUTHOR" | tr '[:upper:]' '[:lower:]')
+            case "$pr_author_lower" in
+              'dependabot[bot]'|'renovate[bot]')
+                case "$(printf '%s' "$AUTO_DEPENDENCY_AUDIT" | tr '[:upper:]' '[:lower:]')" in
+                  false|0|off|no|disabled) mode=none ;;
+                  *)                       mode=audit ;;
+                esac
+                ;;
+              *)
+                case "$(printf '%s' "$AUTO_PR_REVIEW" | tr '[:upper:]' '[:lower:]')" in
+                  false|0|off|no|disabled) mode=none ;;
+                  *)                       mode=review ;;
+                esac
+                ;;
             esac
             emit mode "$mode"
             emit mention ''
             emit model_args ''
-            echo "pull_request event -> mode=$mode (auto_pr_review='$AUTO_PR_REVIEW')"
+            echo "pull_request event (author=$PR_AUTHOR) -> mode=$mode"
             exit 0
           fi
 
@@ -159,6 +191,7 @@ jobs:
             review|reviews|rereview)     mode=review ;;
             fix|fixes|implement|apply)   mode=fix ;;
             ask|explain|question|answer) mode=ask ;;
+            audit|vulnerability|vuln|dependency|dependencies|deps) mode=audit ;;
             # Nothing after the mention but filler: the user is asking what
             # Claude can do, so reply with the command list instead of burning
             # a full run on an empty question.
@@ -213,7 +246,10 @@ jobs:
           | `{{M}} review` | Reviews the PR against this repo's docs, leaves inline comments plus a summary | No |
           | `{{M}} fix <description>` | Implements the change and commits it | **Yes** |
           | `{{M}} ask <question>` | Investigates and answers in a comment | No |
+          | `{{M}} audit` | Summarizes a dependency bump: vulnerability fixed, affected files in this repo, new features, deprecations | No |
           | `{{M}} <anything else>` | Treated as `ask` — nothing is written | No |
+
+          `audit` also runs automatically when Dependabot/Renovate opens a PR.
 
           Pick a model by extending the mention — this composes with every
           command: `@claude-opus review`, `@claude-haiku fix <description>`.
@@ -467,4 +503,86 @@ jobs:
 
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            ${{ needs.dispatch.outputs.model_args }}
+
+  # ---------------------------------------------------------------------------
+  # AUDIT — summarize a dependency bump: what vulnerability it fixes, which
+  # files in this repo actually use the package, what's new upstream, and
+  # what's deprecated. Runs automatically on Dependabot/Renovate PRs, or on
+  # demand via `@claude audit`. Read-only, same as `review`.
+  # ---------------------------------------------------------------------------
+  claude-audit:
+    needs: dispatch
+    if: needs.dispatch.outputs.mode == 'audit'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Comment-triggered audits act as the commenter; automatic audits (on a
+      # Dependabot/Renovate PR) act as the PR author, same pattern as review.
+      - name: Ensure developer token exists
+        env:
+          DEV_TOKEN: ${{ secrets.pr_author_token }}
+          ACTOR: ${{ github.event.pull_request.user.login || github.actor }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEV_TOKEN" ]; then
+            name="CLAUDE_TOKEN_$(printf '%s' "$ACTOR" | tr '[:lower:]-' '[:upper:]_')"
+            echo "::error::No Claude token found for '$ACTOR'." \
+              "Add a repository secret named '$name' with a long-lived token" \
+              "(https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)."
+            exit 1
+          fi
+
+      - name: Run Claude Code (dependency audit)
+        uses: anthropics/claude-code-action@v1.0.66
+        with:
+          claude_code_oauth_token: ${{ secrets.pr_author_token }}
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+
+            This pull request bumps one or more dependencies (likely a
+            Dependabot/Renovate security or version update). Investigate it
+            and post a single PR comment with these sections:
+
+            1. **What changed** — for each package whose version changed in
+               this diff (check the manifest/lockfile, e.g. package.json /
+               yarn.lock), the old version, the new version, and whether this
+               bump fixes a known CVE/security advisory (check the PR title
+               and body, and the package's own advisories/changelog if you
+               can reach them).
+            2. **Affected areas in this repo** — grep the codebase for every
+               import/usage of each bumped package and list the actual
+               files/modules that depend on it. If a package is only a
+               transitive dependency with no direct usage here, say so
+               plainly instead of listing unrelated files.
+            3. **New features** — from the package's changelog/release notes
+               between the old and new version, list new capabilities that
+               are relevant to how this repo already uses the package. Skip
+               anything irrelevant to this codebase.
+            4. **Deprecations / breaking changes** — anything marked
+               deprecated or breaking between the two versions, cross-checked
+               against the usage sites found in step 2. State explicitly if
+               none of this repo's usage sites are affected.
+
+            If you cannot find a changelog or release notes for a package,
+            say so instead of guessing.
+
+            This is a read-only audit. Do not modify, commit, or push any
+            files — if a follow-up code change is needed because of a
+            deprecation, describe it and tell the author to run
+            `@claude fix <description>` to have it applied.
+
+          claude_args: |
+            --allowedTools "WebFetch,WebSearch,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git log:*),Bash(git diff:*)"
             ${{ needs.dispatch.outputs.model_args }}
