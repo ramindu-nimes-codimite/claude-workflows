@@ -506,10 +506,10 @@ jobs:
             ${{ needs.dispatch.outputs.model_args }}
 
   # ---------------------------------------------------------------------------
-  # AUDIT — summarize a dependency bump: what vulnerability it fixes, which
-  # files in this repo actually use the package, what's new upstream, and
-  # what's deprecated. Runs automatically on Dependabot/Renovate PRs, or on
-  # demand via `@claude audit`. Read-only, same as `review`.
+  # AUDIT — on demand via `@claude audit` only (no automatic trigger). Pulls
+  # Dependabot's own open alerts for the repo's FULL dependency graph (not
+  # just this PR's diff), then reports which are actually used in this repo,
+  # what's new upstream, and what's deprecated. Read-only, same as `review`.
   # ---------------------------------------------------------------------------
   claude-audit:
     needs: dispatch
@@ -521,17 +521,16 @@ jobs:
       issues: write
       id-token: write
       actions: read
+      security-events: read # required to read Dependabot alerts via the API
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
-      # Comment-triggered audits act as the commenter; automatic audits (on a
-      # Dependabot/Renovate PR) act as the PR author, same pattern as review.
       - name: Ensure developer token exists
         env:
-          DEV_TOKEN: ${{ secrets.pr_author_token }}
-          ACTOR: ${{ github.event.pull_request.user.login || github.actor }}
+          DEV_TOKEN: ${{ secrets.actor_token }}
+          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           if [ -z "$DEV_TOKEN" ]; then
@@ -542,47 +541,101 @@ jobs:
             exit 1
           fi
 
+      # The full dependency graph's vulnerability state, straight from
+      # Dependabot — not derived from this PR's diff. Requires "Dependabot
+      # alerts" to be enabled on the repo (Settings > Code security).
+      - name: Fetch open Dependabot alerts
+        id: alerts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/dependabot/alerts" \
+            -X GET -f state=open -f per_page=100 --paginate \
+            --jq '[.[] | {
+              package: .dependency.package.name,
+              ecosystem: .dependency.package.ecosystem,
+              manifest: .dependency.manifest_path,
+              severity: .security_advisory.severity,
+              vulnerable_range: .security_vulnerability.vulnerable_version_range,
+              patched_version: .security_vulnerability.first_patched_version.identifier,
+              summary: .security_advisory.summary,
+              ghsa_id: .security_advisory.ghsa_id,
+              url: .html_url
+            }]' > dependabot-alerts.json 2>alerts-error.log \
+            || echo "[]" > dependabot-alerts.json
+
+          if [ -s alerts-error.log ]; then
+            echo "::warning::Could not fetch Dependabot alerts (Dependabot alerts may not be enabled on this repo):"
+            cat alerts-error.log
+          fi
+
+          count=$(jq 'length' dependabot-alerts.json)
+          echo "Found $count open Dependabot alert(s)."
+
+          delim="ALERTS_EOF_$(openssl rand -hex 16)"
+          {
+            echo "ALERTS_JSON<<$delim"
+            cat dependabot-alerts.json
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Run Claude Code (dependency audit)
         uses: anthropics/claude-code-action@v1.0.66
         with:
-          claude_code_oauth_token: ${{ secrets.pr_author_token }}
+          claude_code_oauth_token: ${{ secrets.actor_token }}
           track_progress: true
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
 
-            This pull request bumps one or more dependencies (likely a
-            Dependabot/Renovate security or version update). Investigate it
-            and post a single PR comment with these sections:
+            Below is the full list of currently OPEN Dependabot security
+            alerts for this repository's entire dependency graph — this is
+            NOT scoped to this PR's diff, it covers every dependency
+            currently installed. Treat it as ground truth; do not
+            re-derive or guess vulnerabilities yourself.
 
-            1. **What changed** — for each package whose version changed in
-               this diff (check the manifest/lockfile, e.g. package.json /
-               yarn.lock), the old version, the new version, and whether this
-               bump fixes a known CVE/security advisory (check the PR title
-               and body, and the package's own advisories/changelog if you
-               can reach them).
+            ${{ steps.alerts.outputs.ALERTS_JSON }}
+
+            If the list above is empty, post a short comment saying there
+            are currently no open Dependabot alerts for this repo, and stop
+            — do not invent findings. (If it looks like an empty list because
+            Dependabot alerts aren't enabled on this repo rather than because
+            there are truly no vulnerabilities, say that instead.)
+
+            Otherwise, post a single PR comment. If there are more than 5
+            alerts, give full treatment (below) only to `critical`/`high`
+            severity ones, and summarize the rest in one line each
+            (package + severity + patched version). For each alert given
+            full treatment, report:
+
+            1. **What's vulnerable** — package name, ecosystem, the manifest
+               it's declared in, the vulnerable version range, the version
+               that fixes it, and a one-line summary of the advisory
+               (include the GHSA link).
             2. **Affected areas in this repo** — grep the codebase for every
-               import/usage of each bumped package and list the actual
-               files/modules that depend on it. If a package is only a
-               transitive dependency with no direct usage here, say so
-               plainly instead of listing unrelated files.
+               import/usage of the package and list the actual files/modules
+               that depend on it. If it's only a transitive dependency with
+               no direct usage here, say so plainly instead of listing
+               unrelated files.
             3. **New features** — from the package's changelog/release notes
-               between the old and new version, list new capabilities that
-               are relevant to how this repo already uses the package. Skip
-               anything irrelevant to this codebase.
-            4. **Deprecations / breaking changes** — anything marked
-               deprecated or breaking between the two versions, cross-checked
-               against the usage sites found in step 2. State explicitly if
-               none of this repo's usage sites are affected.
-
-            If you cannot find a changelog or release notes for a package,
-            say so instead of guessing.
+               between the vulnerable and patched version, list new
+               capabilities relevant to how this repo already uses the
+               package (per step 2). Skip anything irrelevant to this
+               codebase's usage. If you cannot find a changelog, say so
+               instead of guessing.
+            4. **Deprecations / breaking changes** — anything deprecated or
+               breaking between those versions, cross-checked against the
+               usage sites found in step 2. State explicitly if none of this
+               repo's usage sites are affected.
 
             This is a read-only audit. Do not modify, commit, or push any
-            files — if a follow-up code change is needed because of a
-            deprecation, describe it and tell the author to run
-            `@claude fix <description>` to have it applied.
+            files — if a follow-up code change is needed, describe it and
+            tell the author to run `@claude fix <description>` to have it
+            applied.
 
           claude_args: |
-            --allowedTools "WebFetch,WebSearch,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git log:*),Bash(git diff:*)"
+            --allowedTools "WebFetch,WebSearch,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --disallowedTools "Edit,Write,MultiEdit,NotebookEdit,Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git rm:*)"
             ${{ needs.dispatch.outputs.model_args }}
